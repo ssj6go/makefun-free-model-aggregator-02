@@ -297,27 +297,40 @@ async function serve(
       upstream = await dial(candidate.id, buildUpstream(candidate.id));
     } catch {
       // The call never reached the gateway: a failed dial, recorded as one.
+      log(`dial ${candidate.id} failed: the call never reached the gateway`);
       trail.push({ status: 502, code: 'upstream_unreachable', model: candidate.id });
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       const text = upstream.body === null ? '' : await upstream.text().catch(() => '');
-      trail.push({ status: upstream.status, code: errorCodeOf(text), model: candidate.id });
+      const code = errorCodeOf(text);
+      log(`dial ${candidate.id} refused: HTTP ${upstream.status} (${code})`);
+      trail.push({ status: upstream.status, code, model: candidate.id });
       continue;
     }
     const text = await upstream.text().catch(() => '');
-    if (text === '') continue;
+    if (text === '') {
+      log(`dial ${candidate.id} answered with an empty body`);
+      continue;
+    }
     if (stream) {
-      if (!openAIStreamServes(text, token)) continue;
+      if (!openAIStreamServes(text, token)) {
+        log(`dial ${candidate.id} answered but the stream failed the checks`);
+        continue;
+      }
       return { served: { model: candidate.id, json: null, sseText: text, trail }, trail };
     }
     let answer: unknown;
     try {
       answer = JSON.parse(text);
     } catch {
+      log(`dial ${candidate.id} answered with unparsable JSON`);
       continue;
     }
-    if (!isRecord(answer) || !openAIJsonServes(answer, token)) continue;
+    if (!isRecord(answer) || !openAIJsonServes(answer, token)) {
+      log(`dial ${candidate.id} answered but the answer failed the checks`);
+      continue;
+    }
     return { served: { model: candidate.id, json: answer, sseText: null, trail }, trail };
   }
   return { served: null, trail };
@@ -450,26 +463,43 @@ async function register(port: number, report: CatalogReport): Promise<void> {
   if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
 }
 
-/** Poll GET /work every 100 ms; exit 0 the moment it says done. */
+/** Poll GET /work every 100 ms; exit 0 the moment it says done.
+ * The env is up by the time polling starts (register already reached it),
+ * so polls that keep failing mean it is gone: after MAX_POLL_FAILURES
+ * consecutive failures the trial is over either way, and hanging here
+ * until the sandbox kills the process helps nobody, so exit 1 instead. */
+const MAX_POLL_FAILURES = 300;
 function poll(server: Server): void {
   let inFlight = false;
+  let failures = 0;
   const timer = setInterval(() => {
     if (inFlight) return;
     inFlight = true;
     void (async () => {
       try {
         const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
+        if (res.status !== 200) {
+          failures += 1;
+        } else {
+          failures = 0;
+          const work: unknown = await res.json();
+          if (isRecord(work) && work.done === true) {
+            clearInterval(timer);
+            server.close();
+            process.exit(0);
+          }
         }
       } catch {
-        // The env is not reachable yet: try again on the next tick.
+        // The env is not reachable: try again on the next tick.
+        failures += 1;
       } finally {
         inFlight = false;
+      }
+      if (failures >= MAX_POLL_FAILURES) {
+        clearInterval(timer);
+        log(`the env did not answer ${failures} polls in a row: giving up`);
+        server.close();
+        process.exit(1);
       }
     })();
   }, POLL_INTERVAL_MS);
